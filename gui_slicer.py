@@ -3,6 +3,7 @@
 Full 3D visualization with VTK, settings controls, and B-axis preview
 """
 
+import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
