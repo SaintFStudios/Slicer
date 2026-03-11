@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where qmake)",
+      "Bash(where cmake)",
+      "Bash(where g++)",
+      "Bash(where cl)",
+      "Bash(qmake --version)",
+      "Read(//c/Users/Jerem/anaconda3/Library/**)",
+      "Bash(qmake -spec win32-g++ testing.pro)",
+      "Bash(PATH=\"/c/msys64/ucrt64/bin:$PATH\" make -f Makefile.Debug)",
+      "Read(//c/msys64/ucrt64/bin/**)",
+      "Read(//c/msys64/usr/bin/**)",
+      "Bash(where mingw32-make)",
+      "Bash(PATH=\"/c/msys64/ucrt64/bin:$PATH\" mingw32-make -f Makefile.Debug)",
+      "Bash(pacman -Ss qt5-base)",
+      "Bash(/c/msys64/usr/bin/pacman.exe -Ss qt5)",
+      "Bash(/c/msys64/usr/bin/pacman.exe -Ss \"ucrt64.*qt5-base\")",
+      "Bash(rm -f Makefile Makefile.Debug Makefile.Release .qmake.stash)",
+      "Bash(PATH=\"/c/msys64/ucrt64/bin:$PATH\" /c/msys64/ucrt64/bin/qmake.exe testing.pro)"
+    ]
+  }
+}
