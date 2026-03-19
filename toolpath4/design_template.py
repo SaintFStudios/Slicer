@@ -64,7 +64,7 @@ def demo_helix_oscillating_b(
     steps = StepList()
     steps.append(StateChange.set_nozzle_temp(cfg.nozzle_temp))
     steps.append(StateChange.set_bed_temp(cfg.bed_temp))
-    steps.append(StateChange.comment("Helix with oscillating B demo"))
+    steps.append(StateChange.make_comment("Helix with oscillating B demo"))
     steps.extend(h_osc)
 
     # Stats

@@ -163,7 +163,12 @@ class StateChange:
         return cls(kind=StateChangeKind.UNRETRACT, value=length)
 
     @classmethod
-    def comment(cls, text: str) -> StateChange:
+    def make_comment(cls, text: str) -> StateChange:
+        """Create a COMMENT StateChange.
+
+        Named ``make_comment`` (not ``comment``) to avoid shadowing the
+        ``comment`` dataclass field when it defaults to ``None``.
+        """
         return cls(kind=StateChangeKind.COMMENT, comment=text)
 
 

@@ -613,7 +613,7 @@ def _emit_layer_toolpath(
             return _transform_2d_to_3d(px, py, to_3D)
         return (px, py, z)
 
-    steps.append(StateChange.comment(
+    steps.append(StateChange.make_comment(
         f"Layer {layer['index']}  z~{z:.2f}  B={b_deg:.1f}"
     ))
 

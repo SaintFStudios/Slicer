@@ -832,25 +832,34 @@ class SlicerApp:
             messagebox.showerror("Slicing Failed", str(error))
             return
 
-        self.slicer = slicer
-        self.steps = steps
+        try:
+            self.slicer = slicer
+            self.steps = steps
 
-        self.bangle_chart.update(slicer)
-        self.toolpath_viewer.update(steps)
+            self.bangle_chart.update(slicer)
+            self.toolpath_viewer.update(steps)
 
-        cfg = self._build_config()
-        stats = dry_run(steps, cfg)
-        txt = (
-            f"Layers:      {stats.layer_count}\n"
-            f"Moves:       {stats.move_count}\n"
-            f"Path length: {stats.total_path_length_mm:.1f} mm\n"
-            f"Extrusion:   {stats.total_extrusion_mm:.1f} mm\n"
-            f"B range:     [{stats.b_min_deg:.1f}, {stats.b_max_deg:.1f}] deg\n"
-        )
-        self.stats_text.config(state=tk.NORMAL)
-        self.stats_text.delete("1.0", tk.END)
-        self.stats_text.insert("1.0", txt)
-        self.stats_text.config(state=tk.DISABLED)
+            cfg = self._build_config()
+            stats = dry_run(steps, cfg)
+            txt = (
+                f"Layers:      {stats.layer_count}\n"
+                f"Moves:       {stats.move_count}\n"
+                f"Path length: {stats.total_path_length_mm:.1f} mm\n"
+                f"Extrusion:   {stats.total_extrusion_mm:.1f} mm\n"
+                f"B range:     [{stats.b_min_deg:.1f}, {stats.b_max_deg:.1f}] deg\n"
+            )
+            self.stats_text.config(state=tk.NORMAL)
+            self.stats_text.delete("1.0", tk.END)
+            self.stats_text.insert("1.0", txt)
+            self.stats_text.config(state=tk.DISABLED)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.status_label.config(
+                text=f"Preview error: {exc}", foreground="red")
+            self.slice_btn.config(state=tk.NORMAL)
+            self.export_btn.config(state=tk.NORMAL)
+            return
 
         self.export_btn.config(state=tk.NORMAL)
         self.slice_btn.config(state=tk.NORMAL)
