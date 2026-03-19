@@ -21,7 +21,7 @@ from toolpath4.kinematics import tip_to_pivot, pivot_to_tip
 from toolpath4.config import PrinterConfig, default_config
 from toolpath4.compiler import compile_gcode, dry_run
 from toolpath4.preview import preview_matplotlib, preview_plotly
-from toolpath4.slicer import Slicer
+from toolpath4.slicer import Slicer, BuildZone
 
 __all__ = [
     "State", "Move", "StateChange", "StepList",
@@ -30,5 +30,5 @@ __all__ = [
     "PrinterConfig", "default_config",
     "compile_gcode", "dry_run",
     "preview_matplotlib", "preview_plotly",
-    "Slicer",
+    "Slicer", "BuildZone",
 ]
