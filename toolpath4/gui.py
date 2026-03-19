@@ -678,10 +678,8 @@ class SlicerApp:
 
         self.layer_height_var = tk.DoubleVar(value=0.20)
         _spin("Layer Height (mm):", self.layer_height_var, 0.05, 0.50, 0.05, row); row += 1
-        self.perimeter_var = tk.IntVar(value=2)
-        _spin("Perimeters:", self.perimeter_var, 1, 5, 1, row); row += 1
-        self.infill_var = tk.DoubleVar(value=0.20)
-        _spin("Infill Density:", self.infill_var, 0.0, 1.0, 0.05, row); row += 1
+        self.perimeter_var = tk.IntVar(value=3)
+        _spin("Wall Count:", self.perimeter_var, 1, 10, 1, row); row += 1
         self.nozzle_temp_var = tk.IntVar(value=200)
         _spin("Nozzle Temp (C):", self.nozzle_temp_var, 150, 300, 5, row); row += 1
         self.bed_temp_var = tk.IntVar(value=60)
@@ -791,7 +789,6 @@ class SlicerApp:
         return PrinterConfig(
             layer_height=self.layer_height_var.get(),
             perimeter_count=self.perimeter_var.get(),
-            infill_density=self.infill_var.get(),
             nozzle_temp=self.nozzle_temp_var.get(),
             bed_temp=self.bed_temp_var.get(),
         )

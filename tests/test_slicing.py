@@ -1,4 +1,4 @@
-"""Tests for toolpath4.slicer — mesh slicing, perimeters, infill, overhang."""
+"""Tests for toolpath4.slicer -- mesh slicing, perimeters, overhang, FullControl bridge."""
 
 import math
 import os
@@ -13,16 +13,22 @@ try:
 except ImportError:
     HAS_TRIMESH = False
 
+try:
+    import fullcontrol as fc
+    HAS_FC = True
+except ImportError:
+    HAS_FC = False
+
 from shapely.geometry import Polygon
 
 from toolpath4.slicer import (
     perimeter_generation,
-    infill_generation,
     overhang_analysis,
     plan_b_angles_thresholded,
     slice_mesh_along_z,
     load_mesh,
     Slicer,
+    to_fullcontrol,
 )
 from toolpath4.config import PrinterConfig
 from toolpath4.state import Move, StepList
@@ -49,31 +55,15 @@ class TestPerimeters:
         """A polygon smaller than one line_width should produce no perimeters."""
         tiny = Polygon([(0, 0), (0.1, 0), (0.1, 0.1), (0, 0.1)])
         perims = perimeter_generation([tiny], perimeter_count=3, line_width=0.45)
-        # May produce 0 or 1 perimeter — should not crash
+        # May produce 0 or 1 perimeter -- should not crash
         assert isinstance(perims, list)
 
-
-# ---------------------------------------------------------------------------
-# Infill generation
-# ---------------------------------------------------------------------------
-
-class TestInfill:
-    def test_grid_infill_nonempty(self):
-        sq = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
-        lines = infill_generation(sq, density=0.2, line_width=0.45)
-        assert len(lines) > 0
-        for l in lines:
-            assert len(l) >= 2
-
-    def test_zero_density(self):
-        sq = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
-        lines = infill_generation(sq, density=0.0)
-        assert lines == []
-
-    def test_empty_polygon(self):
-        empty = Polygon()
-        lines = infill_generation(empty, density=0.2)
-        assert lines == []
+    def test_more_walls_more_perimeters(self):
+        """More wall count = more perimeter rings (FullControl style)."""
+        sq = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+        perims_2 = perimeter_generation([sq], perimeter_count=2, line_width=0.45)
+        perims_5 = perimeter_generation([sq], perimeter_count=5, line_width=0.45)
+        assert len(perims_5) > len(perims_2)
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +73,10 @@ class TestInfill:
 @pytest.mark.skipif(not HAS_TRIMESH, reason="trimesh not installed")
 class TestOverhang:
     def test_flat_box_no_overhang(self):
-        """A flat box should have low overhang scores (normals are ±X, ±Y, ±Z)."""
+        """A flat box should have low overhang scores (normals are +/-X, +/-Y, +/-Z)."""
         box = trimesh.creation.box(extents=[20, 20, 20])
         box.apply_translation([0, 0, 10])
         scores = overhang_analysis(box, [5.0, 10.0, 15.0], threshold_deg=45.0)
-        # Box faces are axis-aligned: top/bottom normals are vertical → not overhang.
-        # Side faces have 90° from vertical → overhang.
         for z, s in scores.items():
             assert 0.0 <= s <= 1.0
 
@@ -97,7 +85,6 @@ class TestOverhang:
         sphere = trimesh.creation.icosphere(subdivisions=2, radius=10)
         sphere.apply_translation([0, 0, 10])
         scores = overhang_analysis(sphere, [5.0, 10.0, 15.0], threshold_deg=45.0)
-        # Lower half should have higher scores
         assert scores[5.0] > 0.0
 
 
@@ -153,3 +140,55 @@ class TestSlicerPipeline:
         assert len(steps) > 0
         moves = steps.moves()
         assert len(moves) > 0
+
+    def test_no_infill_in_output(self):
+        """FullControl style: output should only contain perimeter walls."""
+        path = self._make_box_stl()
+        slicer = Slicer(config=PrinterConfig(layer_height=1.0, perimeter_count=3))
+        steps = slicer.process(path)
+        # All extrusion moves should be perimeter moves (no infill comments)
+        for step in steps:
+            if hasattr(step, 'comment') and step.comment:
+                assert "infill" not in step.comment.lower()
+
+
+# ---------------------------------------------------------------------------
+# FullControl bridge
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_FC, reason="fullcontrol not installed")
+@pytest.mark.skipif(not HAS_TRIMESH, reason="trimesh not installed")
+class TestFullControlBridge:
+    def _make_box_stl(self) -> str:
+        box = trimesh.creation.box(extents=[20, 20, 10])
+        box.apply_translation([150, 150, 5])
+        path = os.path.join(tempfile.gettempdir(), "test_box_fc.stl")
+        box.export(path)
+        return path
+
+    def test_to_fullcontrol_returns_list(self):
+        path = self._make_box_stl()
+        slicer = Slicer(config=PrinterConfig(layer_height=2.0))
+        steps = slicer.process(path)
+        fc_steps = to_fullcontrol(steps)
+        assert isinstance(fc_steps, list)
+        assert len(fc_steps) > 0
+
+    def test_fc_contains_points(self):
+        path = self._make_box_stl()
+        slicer = Slicer(config=PrinterConfig(layer_height=2.0))
+        steps = slicer.process(path)
+        fc_steps = to_fullcontrol(steps)
+        points = [s for s in fc_steps if isinstance(s, fc.Point)]
+        assert len(points) > 0
+
+    def test_fc_generates_gcode(self):
+        path = self._make_box_stl()
+        slicer = Slicer(config=PrinterConfig(layer_height=2.0))
+        steps = slicer.process(path)
+        fc_steps = to_fullcontrol(steps)
+        gcode = fc.transform(fc_steps, 'gcode',
+                             fc.GcodeControls(printer_name='generic'),
+                             show_tips=False)
+        assert len(gcode) > 100
+        assert "G1" in gcode

@@ -1,34 +1,38 @@
 """
-toolpath4.slicer — Mesh slicing, overhang analysis, B-angle planning,
-and explicit toolpath generation.
+toolpath4.slicer -- Mesh slicing and toolpath generation (FullControl-style).
+
+Inspired by FullControl's philosophy: the toolpath IS the structure.
+No infill generation -- perimeter walls define the geometry.  Every
+toolpath is an explicit stream of points + state, nothing hidden.
 
 Pipeline
 --------
-1. load_mesh            — import & validate an STL via trimesh.
-2. slice_mesh_along_z   — horizontal cross-sections → 2-D polygons.
-   slice_mesh_along_dir — *variable* build-direction slicing (tilted planes).
-3. perimeter_generation — repeated negative buffer → perimeter polylines.
-4. infill_generation    — grid lines clipped to inner polygon.
-5. overhang_analysis    — per-layer overhang score from face normals.
-6. B-angle planning     — threshold-based angle assignment with transitions.
-7. Toolpath emission    — perimeters + infill → Move / StateChange stream.
+1. load_mesh              -- import & validate an STL via trimesh.
+2. slice_mesh_along_z     -- horizontal cross-sections -> 2-D polygons.
+   slice_mesh_along_dir   -- variable build-direction slicing (tilted planes).
+3. perimeter_generation   -- repeated inset offsets -> perimeter polylines.
+4. overhang_analysis      -- per-layer overhang score from face normals.
+5. B-angle planning       -- threshold-based angle assignment with transitions.
+6. Toolpath emission      -- perimeters -> Move / StateChange stream.
+
+FullControl bridge: ``to_fullcontrol(steps)`` converts our Step list to a
+FullControl-compatible list of ``fc.Point`` / ``fc.Extruder`` / etc. for
+gcode generation and visualisation via ``fc.transform()``.
 
 Variable Slicing Coordinate System
 -----------------------------------
-A ``BuildZone`` defines a region of the print where all layers share the
-same build direction (slicing plane orientation).  The build direction is
-determined by the B angle:
+A ``BuildZone`` defines a region where all layers share the same build
+direction (slicing plane orientation).  The build direction is determined
+by the B angle:
 
-  B =  0° → build_dir = [0, 0, 1]  (horizontal, normal 3-axis printing)
-  B = 45° → build_dir = [sin45, 0, cos45]  (tilted 45°)
-  B = 90° → build_dir = [1, 0, 0]  (vertical / sideways)
+  B =  0 deg -> build_dir = [0, 0, 1]  (horizontal, normal 3-axis printing)
+  B = 45 deg -> build_dir = [sin45, 0, cos45]  (tilted 45 deg)
+  B = 90 deg -> build_dir = [1, 0, 0]  (vertical / sideways)
 
 The slicing plane is always perpendicular to the build direction.
-2-D toolpath geometry (perimeters, infill) is generated in the plane's
-local coordinate system, then transformed back to 3-D world coordinates
+2-D toolpath geometry (perimeters) is generated in the plane's local
+coordinate system, then transformed back to 3-D world coordinates
 via the ``to_3D`` affine matrix returned by ``trimesh.path.to_planar()``.
-
-Every decision is explicit geometry — no hidden "magic".
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ from toolpath4.state import (
 
 
 # ===================================================================
-# BuildZone — variable slicing coordinate system
+# BuildZone -- variable slicing coordinate system
 # ===================================================================
 
 @dataclass
@@ -93,7 +97,7 @@ class BuildZone:
     label: str = ""
 
     def __str__(self) -> str:
-        return (f"BuildZone(B={self.b_deg:.1f}°, "
+        return (f"BuildZone(B={self.b_deg:.1f} deg, "
                 f"z=[{self.z_start:.1f}, {self.z_end:.1f}], "
                 f"'{self.label}')")
 
@@ -243,11 +247,11 @@ def slice_mesh_along_direction(
     Returns
     -------
     List of layer dicts.  Each dict contains:
-      ``z``        — approximate world-Z of the layer centre.
-      ``polygons`` — list of shapely Polygons in the plane's 2-D frame.
-      ``to_3D``    — 4×4 affine matrix mapping (x2d, y2d, 0) → world XYZ.
-      ``b_deg``    — the B angle for this zone.
-      ``index``    — sequential layer index.
+      ``z``        -- approximate world-Z of the layer centre.
+      ``polygons`` -- list of shapely Polygons in the plane's 2-D frame.
+      ``to_3D``    -- 4x4 affine matrix mapping (x2d, y2d, 0) -> world XYZ.
+      ``b_deg``    -- the B angle for this zone.
+      ``index``    -- sequential layer index.
     """
     n = build_direction(b_deg)
 
@@ -291,14 +295,14 @@ def slice_mesh_along_direction(
                 world_z, polys, idx, b_deg=b_deg, to_3D=to_3D,
             ))
 
-    print(f"Sliced {len(layers)} layers along B={b_deg:.1f}° "
+    print(f"Sliced {len(layers)} layers along B={b_deg:.1f} deg "
           f"(z~{layers[0]['z']:.1f}-{layers[-1]['z']:.1f})" if layers else
           f"Sliced 0 layers along B={b_deg:.1f} deg")
     return layers
 
 
 # ===================================================================
-# Section → polygon helpers
+# Section -> polygon helpers
 # ===================================================================
 
 def _section_to_polygons(section) -> List[Polygon]:
@@ -310,7 +314,7 @@ def _section_to_polygons(section) -> List[Polygon]:
 def _section_to_polygons_with_transform(section):
     """Return ``(polygons, to_3D_matrix)`` for a section.
 
-    ``to_3D`` is the 4×4 affine that maps ``[x2d, y2d, 0, 1]`` back
+    ``to_3D`` is the 4x4 affine that maps ``[x2d, y2d, 0, 1]`` back
     to world coordinates.
     """
     to_3D = np.eye(4)
@@ -324,8 +328,25 @@ def _section_to_polygons_with_transform(section):
 
 
 def _extract_polygons_from_path2d(path2d) -> List[Polygon]:
-    """Extract shapely Polygons from a trimesh Path2D."""
+    """Extract shapely Polygons from a trimesh Path2D.
+
+    Tries ``polygons_full`` first (standard trimesh API returning Shapely
+    Polygons with holes resolved), then falls back to ``polygons_closed``
+    and entity-based reconstruction.
+    """
     polygons: List[Polygon] = []
+
+    # Method 1: polygons_full (returns Shapely Polygons directly)
+    try:
+        for p in path2d.polygons_full:
+            if p is not None and p.is_valid and p.area > 1e-6:
+                polygons.append(p)
+        if polygons:
+            return polygons
+    except (AttributeError, TypeError, Exception):
+        pass
+
+    # Method 2: polygons_closed (returns vertex arrays)
     try:
         for poly_verts in path2d.polygons_closed:
             if poly_verts is not None:
@@ -335,28 +356,30 @@ def _extract_polygons_from_path2d(path2d) -> List[Polygon]:
                         polygons.append(p)
                 except Exception:
                     pass
+        if polygons:
+            return polygons
     except (AttributeError, TypeError):
         pass
 
-    if not polygons:
-        try:
-            for entity in path2d.entities:
-                pts = path2d.vertices[entity.points]
-                if len(pts) >= 3:
-                    try:
-                        p = Polygon(pts[:, :2])
-                        if p.is_valid and p.area > 1e-6:
-                            polygons.append(p)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    # Method 3: entity-based fallback
+    try:
+        for entity in path2d.entities:
+            pts = path2d.vertices[entity.points]
+            if len(pts) >= 3:
+                try:
+                    p = Polygon(pts[:, :2])
+                    if p.is_valid and p.area > 1e-6:
+                        polygons.append(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return polygons
 
 
 # ===================================================================
-# 2-D ↔ 3-D coordinate helpers
+# 2-D <-> 3-D coordinate helpers
 # ===================================================================
 
 def _transform_2d_to_3d(x2d: float, y2d: float, to_3D: np.ndarray):
@@ -365,7 +388,7 @@ def _transform_2d_to_3d(x2d: float, y2d: float, to_3D: np.ndarray):
     Parameters
     ----------
     x2d, y2d : coordinates in the section's local 2-D frame.
-    to_3D : 4×4 affine from ``section.to_planar()``.
+    to_3D : 4x4 affine from ``section.to_planar()``.
 
     Returns
     -------
@@ -376,7 +399,7 @@ def _transform_2d_to_3d(x2d: float, y2d: float, to_3D: np.ndarray):
 
 
 # ===================================================================
-# 3) Perimeter generation
+# 3) Perimeter generation (FullControl style -- walls ARE the structure)
 # ===================================================================
 
 def perimeter_generation(
@@ -385,6 +408,9 @@ def perimeter_generation(
     line_width: float = 0.45,
 ) -> List[List[Tuple[float, float]]]:
     """Generate *perimeter_count* inset perimeters from *polygons*.
+
+    FullControl philosophy: the perimeter walls define the part geometry.
+    No infill -- just walls.  Use more perimeters for stronger parts.
 
     Each perimeter is a list of (x, y) coordinate tuples forming a closed
     polyline.
@@ -396,75 +422,35 @@ def perimeter_generation(
         return []
 
     perimeters: List[List[Tuple[float, float]]] = []
-    current = merged
     for i in range(perimeter_count):
         offset = -(i + 0.5) * line_width
-        inset = current.buffer(offset, join_style="mitre", mitre_limit=2.0)
+        inset = merged.buffer(offset, join_style="mitre", mitre_limit=2.0)
         if inset.is_empty:
             break
-        for ring in _polygon_exterior_rings(inset):
+        for ring in _polygon_rings(inset):
             perimeters.append(list(ring.coords))
     return perimeters
 
 
-def _polygon_exterior_rings(geom) -> list:
+def _polygon_rings(geom) -> list:
+    """Extract all exterior and interior rings from a geometry."""
     rings = []
     if isinstance(geom, Polygon):
         if not geom.is_empty:
             rings.append(geom.exterior)
+            for interior in geom.interiors:
+                rings.append(interior)
     elif isinstance(geom, MultiPolygon):
         for p in geom.geoms:
             if not p.is_empty:
                 rings.append(p.exterior)
+                for interior in p.interiors:
+                    rings.append(interior)
     return rings
 
 
 # ===================================================================
-# 4) Infill generation
-# ===================================================================
-
-def infill_generation(
-    inner_polygon: Polygon | MultiPolygon,
-    density: float = 0.20,
-    line_width: float = 0.45,
-    angle_deg: float = 45.0,
-) -> List[List[Tuple[float, float]]]:
-    """Generate grid infill lines clipped to *inner_polygon*."""
-    if inner_polygon is None or inner_polygon.is_empty:
-        return []
-    if density <= 0:
-        return []
-
-    spacing = line_width / density if density < 1.0 else line_width
-    bounds = inner_polygon.bounds
-    minx, miny, maxx, maxy = bounds
-    diag = math.sqrt((maxx - minx) ** 2 + (maxy - miny) ** 2)
-    cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
-
-    lines: List[LineString] = []
-    y = cy - diag / 2
-    while y <= cy + diag / 2:
-        l = LineString([(cx - diag / 2, y), (cx + diag / 2, y)])
-        lines.append(l)
-        y += spacing
-
-    rotated = [affinity.rotate(l, angle_deg, origin=(cx, cy)) for l in lines]
-
-    result: List[List[Tuple[float, float]]] = []
-    for line in rotated:
-        clipped = inner_polygon.intersection(line)
-        if clipped.is_empty:
-            continue
-        if isinstance(clipped, LineString):
-            result.append(list(clipped.coords))
-        elif isinstance(clipped, MultiLineString):
-            for seg in clipped.geoms:
-                result.append(list(seg.coords))
-    return result
-
-
-# ===================================================================
-# 5) Overhang analysis
+# 4) Overhang analysis
 # ===================================================================
 
 def overhang_analysis(
@@ -500,7 +486,7 @@ def overhang_analysis(
 
 
 # ===================================================================
-# 6) B-angle planning
+# 5) B-angle planning
 # ===================================================================
 
 CANDIDATE_ANGLES = [90.0, 45.0, 35.0]
@@ -589,7 +575,7 @@ def _apply_transition(angles, z_values, n_layers, kind):
 
 
 # ===================================================================
-# 7) Toolpath emission — layer → Moves
+# 6) Toolpath emission -- layer -> Moves (perimeters only, no infill)
 # ===================================================================
 
 def _emit_layer_toolpath(
@@ -599,8 +585,11 @@ def _emit_layer_toolpath(
 ) -> None:
     """Append Move / StateChange steps for one layer to *steps*.
 
+    FullControl style: only perimeter walls are emitted.  No infill.
+    The walls ARE the structure.
+
     Handles both horizontal layers (``to_3D is None``) and tilted layers
-    (``to_3D`` is a 4×4 affine from the section plane).
+    (``to_3D`` is a 4x4 affine from the section plane).
     """
     z = layer["z"]
     b_deg = layer.get("b_deg", 0.0)
@@ -608,7 +597,7 @@ def _emit_layer_toolpath(
     to_3D = layer.get("to_3D")  # None for classic horizontal layers
 
     def _world(px, py):
-        """Map 2-D toolpath point → 3-D world coordinates."""
+        """Map 2-D toolpath point -> 3-D world coordinates."""
         if to_3D is not None:
             return _transform_2d_to_3d(px, py, to_3D)
         return (px, py, z)
@@ -628,49 +617,112 @@ def _emit_layer_toolpath(
         b_angle_deg=b_deg,
     )
 
-    # --- Perimeters ---
+    # --- Perimeters (walls = the structure, FullControl style) ---
     perims = perimeter_generation(polys, cfg.perimeter_count, cfg.line_width)
     for perim in perims:
         if not perim:
             continue
         sx, sy = perim[0]
         wx, wy, wz = _world(sx, sy)
+        # Travel to start of perimeter (retract -> move -> unretract)
         steps.append(StateChange.retract(cfg.retract_length))
         steps.append(Move(x=wx, y=wy, z=wz, b=b_deg, state=travel_state))
         steps.append(StateChange.unretract(cfg.retract_length))
+        # Extrude along perimeter
         for px, py in perim[1:]:
             wx, wy, wz = _world(px, py)
             steps.append(Move(x=wx, y=wy, z=wz, b=b_deg, state=print_state))
 
-    # --- Infill ---
-    if cfg.infill_density > 0 and polys:
-        inner_offset = -(cfg.perimeter_count + 0.5) * cfg.line_width
-        inner_region = unary_union(polys).buffer(
-            inner_offset, join_style="mitre", mitre_limit=2.0,
+
+# ===================================================================
+# FullControl bridge -- convert our steps to fc-compatible list
+# ===================================================================
+
+def to_fullcontrol(steps: list, cfg: PrinterConfig | None = None):
+    """Convert a toolpath4 StepList to a FullControl-compatible list.
+
+    Returns a list of ``fc.Point``, ``fc.Extruder``, ``fc.Hotend``,
+    ``fc.Buildplate``, ``fc.Fan``, ``fc.ManualGcode``, etc.
+
+    Requires ``fullcontrol`` to be installed.
+
+    Parameters
+    ----------
+    steps : our StepList (Move + StateChange objects).
+    cfg : printer config for initial setup.
+
+    Returns
+    -------
+    list of FullControl objects ready for ``fc.transform()``.
+    """
+    try:
+        import fullcontrol as fc
+    except ImportError:
+        raise ImportError(
+            "fullcontrol is required for this feature.\n"
+            "Install with:  pip install git+https://github.com/FullControlXYZ/fullcontrol"
         )
-        infill_angle = 45.0 if layer["index"] % 2 == 0 else 135.0
-        infill_lines = infill_generation(
-            inner_region, cfg.infill_density, cfg.line_width, infill_angle,
-        )
-        for line in infill_lines:
-            if len(line) < 2:
+
+    if cfg is None:
+        cfg = default_config()
+
+    fc_steps = []
+
+    # Initial setup
+    fc_steps.append(fc.Hotend(temp=cfg.nozzle_temp, wait=True))
+    fc_steps.append(fc.Buildplate(temp=cfg.bed_temp))
+    fc_steps.append(fc.Fan(speed_percent=0))
+    fc_steps.append(fc.ExtrusionGeometry(width=cfg.line_width, height=cfg.layer_height))
+    fc_steps.append(fc.Printer(
+        print_speed=cfg.max_feedrate_xyz * 0.6,
+        travel_speed=cfg.travel_speed,
+    ))
+
+    extruding = True  # fc starts with extrusion on
+
+    for step in steps:
+        if isinstance(step, Move):
+            if None in (step.x, step.y, step.z):
                 continue
-            sx, sy = line[0]
-            wx, wy, wz = _world(sx, sy)
-            steps.append(StateChange.retract(cfg.retract_length))
-            steps.append(Move(x=wx, y=wy, z=wz, b=b_deg, state=travel_state))
-            steps.append(StateChange.unretract(cfg.retract_length))
-            for px, py in line[1:]:
-                wx, wy, wz = _world(px, py)
-                steps.append(Move(x=wx, y=wy, z=wz, b=b_deg, state=print_state))
+
+            want_extrude = step.state.extrusion_mode == ExtrusionMode.ON
+
+            if want_extrude and not extruding:
+                fc_steps.append(fc.Extruder(on=True))
+                extruding = True
+            elif not want_extrude and extruding:
+                fc_steps.append(fc.Extruder(on=False))
+                extruding = False
+
+            # B axis as a manual G-code annotation
+            pt = fc.Point(x=step.x, y=step.y, z=step.z)
+            fc_steps.append(pt)
+
+        elif isinstance(step, StateChange):
+            from toolpath4.state import StateChangeKind
+            if step.kind == StateChangeKind.SET_NOZZLE_TEMP:
+                fc_steps.append(fc.Hotend(temp=int(step.value or 0)))
+            elif step.kind == StateChangeKind.SET_BED_TEMP:
+                fc_steps.append(fc.Buildplate(temp=int(step.value or 0)))
+            elif step.kind == StateChangeKind.SET_FAN:
+                fc_steps.append(fc.Fan(speed_percent=int((step.value or 0) * 100)))
+            elif step.kind == StateChangeKind.COMMENT:
+                fc_steps.append(fc.ManualGcode(
+                    text=f"; {step.comment or ''}"))
+            # Retract/unretract handled by fc.Extruder on/off
+
+    return fc_steps
 
 
 # ===================================================================
-# Slicer — main pipeline
+# Slicer -- main pipeline
 # ===================================================================
 
 class Slicer:
-    """Complete slicing pipeline: mesh → list of Steps.
+    """Complete slicing pipeline: mesh -> list of Steps.
+
+    FullControl-inspired: perimeter walls define the geometry.  No infill.
+    More perimeters = stronger parts.
 
     Supports two modes:
 
@@ -742,10 +794,10 @@ class Slicer:
 
         z_values = [l["z"] for l in self.layers]
 
-        # 5) Overhang analysis
+        # 4) Overhang analysis
         self.overhang_scores = overhang_analysis(mesh, z_values)
 
-        # 6) B-angle planning
+        # 5) B-angle planning
         self.b_angles = plan_b_angles_thresholded(
             self.overhang_scores, z_values)
         if z_overrides:
@@ -764,7 +816,7 @@ class Slicer:
         for layer in self.layers:
             layer["b_deg"] = self.b_angles.get(layer["z"], 0.0)
 
-        # 7) Emit toolpath
+        # 6) Emit toolpath (perimeters only -- FullControl style)
         return self._emit_all_layers()
 
     # ------------------------------------------------------------------
@@ -782,7 +834,7 @@ class Slicer:
         global_idx = 0
         for zone in sorted(zones, key=lambda z: z.z_start):
             if abs(zone.b_deg) < 0.01:
-                # Horizontal slicing for B ≈ 0
+                # Horizontal slicing for B ~ 0
                 zone_layers = slice_mesh_along_z(
                     mesh, cfg.layer_height,
                     z_min=zone.z_start,
@@ -841,5 +893,5 @@ class Slicer:
         for z in sorted(self.b_angles):
             score = self.overhang_scores.get(z, 0.0)
             lines.append(
-                f"  z={z:8.2f}       B={self.b_angles[z]:6.1f}°     {score:.3f}")
+                f"  z={z:8.2f}       B={self.b_angles[z]:6.1f} deg     {score:.3f}")
         return "\n".join(lines)
