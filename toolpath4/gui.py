@@ -17,11 +17,19 @@ Features:
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from typing import Optional
+
+# Ensure the parent directory of toolpath4/ is on sys.path so that
+# ``python toolpath4/gui.py`` works even without installing the package.
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_PROJECT_DIR = _PACKAGE_DIR.parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
 
 import numpy as np
 import matplotlib
