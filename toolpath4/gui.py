@@ -48,7 +48,7 @@ except ImportError:
 from toolpath4.config import PrinterConfig
 from toolpath4.state import Move, StepList
 from toolpath4.compiler import compile_gcode, dry_run
-from toolpath4.preview import _extract_arrays
+from toolpath4.preview import _extract_arrays, _extract_segments
 from toolpath4.slicer import BuildZone, Slicer, load_mesh, build_direction
 
 
@@ -264,25 +264,41 @@ class ToolpathViewer:
         while self.fig.axes[1:]:
             self.fig.delaxes(self.fig.axes[-1])
 
-        xs, ys, zs, bs = _extract_arrays(steps)
-        if len(xs) < 2:
+        extrude_segs, travel_segs, all_pts = _extract_segments(steps)
+        if len(all_pts) < 2:
             self.ax.set_title("No toolpath to preview")
             self.canvas.draw()
             return
 
-        self._pts = np.column_stack([xs, ys, zs])
-        points = self._pts.reshape(-1, 1, 3)
-        segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        seg_vals = (bs[:-1] + bs[1:]) / 2.0
+        self._pts = all_pts
 
-        norm = plt.Normalize(vmin=bs.min(), vmax=bs.max())
-        lc = Line3DCollection(segments, cmap="coolwarm", norm=norm)
-        lc.set_array(seg_vals)
-        lc.set_linewidth(0.6)
-        self.ax.add_collection3d(lc)
+        # Determine global colour range from all extrusion B values
+        all_bs = np.concatenate([bs for _, bs in extrude_segs]) if extrude_segs else np.array([0.0])
+        vmin, vmax = float(all_bs.min()), float(all_bs.max())
+        if abs(vmax - vmin) < 1e-6:
+            vmax = vmin + 1.0
+        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+        # Draw extrusion segments as coloured lines
+        n_ext_pts = 0
+        for pts, bs in extrude_segs:
+            n_ext_pts += len(pts)
+            points = pts.reshape(-1, 1, 3)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            seg_vals = (bs[:-1] + bs[1:]) / 2.0
+            lc = Line3DCollection(segments, cmap="coolwarm", norm=norm)
+            lc.set_array(seg_vals)
+            lc.set_linewidth(0.6)
+            self.ax.add_collection3d(lc)
+
+        # Draw travel segments as thin grey lines
+        for pts in travel_segs:
+            self.ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
+                         color="grey", linewidth=0.3, alpha=0.25)
 
         _equalize_3d_axes(self.ax, self._pts)
-        self.ax.set_title(f"Toolpath ({len(xs)} points)")
+        self.ax.set_title(f"Toolpath ({n_ext_pts} extrusion pts, "
+                          f"{len(travel_segs)} travels)")
 
         sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=norm)
         sm.set_array([])

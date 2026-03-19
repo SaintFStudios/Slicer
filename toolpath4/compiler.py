@@ -96,11 +96,12 @@ def compile_gcode(
     # Start G-code
     lines.append(config.rendered_start_gcode())
 
-    # Modal state tracking — we only emit values that change.
-    prev_x: Optional[float] = None
-    prev_y: Optional[float] = None
-    prev_z: Optional[float] = None
-    prev_b: Optional[float] = None
+    # Previous machine-coordinate positions (for modal optimisation and
+    # distance computation).  Initialised to None → first move always emitted.
+    prev_mx: Optional[float] = None
+    prev_my: Optional[float] = None
+    prev_mz: Optional[float] = None
+    prev_mb: Optional[float] = None
     prev_f: Optional[float] = None
     e_total: float = 0.0  # cumulative extrusion
 
@@ -117,48 +118,50 @@ def compile_gcode(
         if transform_to_machine and None not in (mx, my, mz, mb):
             mx, my, mz = tip_to_pivot((mx, my, mz), mb, config)
 
-        # Build G-code tokens
+        # Compute XYZ distance from previous position BEFORE updating
+        # modal state — needed for extrusion calculation.
         is_extrude = step.state.extrusion_mode == ExtrusionMode.ON
+        dist = 0.0
+        if is_extrude and prev_mx is not None:
+            dx = (mx or 0) - prev_mx
+            dy = (my or 0) - prev_my
+            dz = (mz or 0) - prev_mz
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        # Build G-code tokens (modal — only emit changed values)
         cmd = "G1" if is_extrude or step.state.feedrate != config.travel_speed else "G0"
         tokens: List[str] = [cmd]
 
-        if mx is not None and mx != prev_x:
+        if mx is not None and mx != prev_mx:
             tokens.append(f"X{_fmt(mx)}")
-            prev_x = mx
-        if my is not None and my != prev_y:
+        if my is not None and my != prev_my:
             tokens.append(f"Y{_fmt(my)}")
-            prev_y = my
-        if mz is not None and mz != prev_z:
+        if mz is not None and mz != prev_mz:
             tokens.append(f"Z{_fmt(mz)}")
-            prev_z = mz
-        if mb is not None and mb != prev_b:
+        if mb is not None and mb != prev_mb:
             tokens.append(f"B{_fmt(mb, 2)}")
-            prev_b = mb
 
         # Extrusion
-        if is_extrude and prev_x is not None and prev_y is not None:
-            # Distance from previous position
-            dx = (mx or 0) - (prev_x or 0) if mx != prev_x else 0
-            dy = (my or 0) - (prev_y or 0) if my != prev_y else 0
-            dz = (mz or 0) - (prev_z or 0) if mz != prev_z else 0
-            # Recalc — we just set prev_*, so compute from the actual deltas
-            # We need the *old* prev values. Fix: track separately.
-            pass  # handled below
+        if dist > 0:
+            de = dist * e_per_mm * step.state.extrusion_multiplier
+            e_total += de
+            tokens.append(f"E{_fmt(e_total, 4)}")
 
-        # We need old positions for distance calc — fix the modal tracking.
-        # Recalculate using step's own coordinates.
-        if is_extrude:
-            dist = _move_distance(step, toolpath, config, transform_to_machine)
-            if dist > 0:
-                de = dist * e_per_mm * step.state.extrusion_multiplier
-                e_total += de
-                tokens.append(f"E{_fmt(e_total, 4)}")
-
-        # Feedrate
+        # Feedrate (modal)
         f = step.state.feedrate
         if f != prev_f:
             tokens.append(f"F{_fmt(f, 0)}")
             prev_f = f
+
+        # Update previous positions AFTER building the line
+        if mx is not None:
+            prev_mx = mx
+        if my is not None:
+            prev_my = my
+        if mz is not None:
+            prev_mz = mz
+        if mb is not None:
+            prev_mb = mb
 
         if len(tokens) > 1:  # more than just the G command
             lines.append(" ".join(tokens))
@@ -166,30 +169,6 @@ def compile_gcode(
     # End G-code
     lines.append(config.rendered_end_gcode())
     return "\n".join(lines)
-
-
-def _move_distance(step: Move, toolpath: list, config: PrinterConfig,
-                   transform: bool) -> float:
-    """Compute XYZ distance from the previous Move to *step*."""
-    idx = None
-    for i, s in enumerate(toolpath):
-        if s is step:
-            idx = i
-            break
-    if idx is None or idx == 0:
-        return 0.0
-    # Walk back to find the previous Move
-    for j in range(idx - 1, -1, -1):
-        prev = toolpath[j]
-        if isinstance(prev, Move):
-            x0, y0, z0 = prev.x or 0, prev.y or 0, prev.z or 0
-            x1, y1, z1 = step.x or 0, step.y or 0, step.z or 0
-            if transform and None not in (prev.x, prev.y, prev.z, prev.b):
-                x0, y0, z0 = tip_to_pivot((x0, y0, z0), prev.b or 0, config)
-            if transform and None not in (step.x, step.y, step.z, step.b):
-                x1, y1, z1 = tip_to_pivot((x1, y1, z1), step.b or 0, config)
-            return math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
-    return 0.0
 
 
 def _compile_state_change(sc: StateChange, config: PrinterConfig) -> str:

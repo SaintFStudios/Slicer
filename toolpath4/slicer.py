@@ -158,7 +158,7 @@ def load_mesh(path: str, *, attempt_repair: bool = True) -> "trimesh.Trimesh":
               "Slicing may produce incomplete layers.")
 
     print(f"Mesh loaded: {len(mesh.faces)} faces, "
-          f"bounds {mesh.bounds[0]} → {mesh.bounds[1]}, "
+          f"bounds {mesh.bounds[0]} -> {mesh.bounds[1]}, "
           f"watertight={mesh.is_watertight}")
     return mesh
 
@@ -292,8 +292,8 @@ def slice_mesh_along_direction(
             ))
 
     print(f"Sliced {len(layers)} layers along B={b_deg:.1f}° "
-          f"(z≈{layers[0]['z']:.1f}–{layers[-1]['z']:.1f})" if layers else
-          f"Sliced 0 layers along B={b_deg:.1f}°")
+          f"(z~{layers[0]['z']:.1f}-{layers[-1]['z']:.1f})" if layers else
+          f"Sliced 0 layers along B={b_deg:.1f} deg")
     return layers
 
 
@@ -614,7 +614,7 @@ def _emit_layer_toolpath(
         return (px, py, z)
 
     steps.append(StateChange.comment(
-        f"Layer {layer['index']}  z≈{z:.2f}  B={b_deg:.1f}°"
+        f"Layer {layer['index']}  z~{z:.2f}  B={b_deg:.1f}"
     ))
 
     print_state = State(
