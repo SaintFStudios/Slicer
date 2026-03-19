@@ -10,7 +10,8 @@ Features:
   - STL file browser and 3D model viewer (equal-aspect, isometric home)
   - Build Zone editor for variable slicing coordinate systems
   - B-angle schedule chart (post-slice, driven by real overhang analysis)
-  - 3D toolpath preview colour-coded by B angle
+  - 3D toolpath preview colour-coded by B angle with PrusaSlicer-style
+    layer slider for scrubbing through the build
   - G-code export via Save-As dialog
 """
 
@@ -46,9 +47,8 @@ except ImportError:
     trimesh = None  # type: ignore[assignment]
 
 from toolpath4.config import PrinterConfig
-from toolpath4.state import Move, StepList
+from toolpath4.state import ExtrusionMode, Move, StateChange as SC, StepList
 from toolpath4.compiler import compile_gcode, dry_run
-from toolpath4.preview import _extract_arrays, _extract_segments
 from toolpath4.slicer import BuildZone, Slicer, load_mesh, build_direction
 
 
@@ -75,6 +75,10 @@ def _equalize_3d_axes(ax, verts: np.ndarray):
     ax.view_init(elev=25, azim=-60)
 
 
+# Maximum extrusion points to display (keeps rotation interactive)
+_MAX_DISPLAY_POINTS = 8000
+
+
 # ===================================================================
 # 3-D model viewer
 # ===================================================================
@@ -91,13 +95,12 @@ class ModelViewer:
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Toolbar + custom Reset View button
+        # Toolbar — override home to be iso-view reset
         bar_frame = ttk.Frame(frame)
         bar_frame.pack(fill=tk.X)
         self._toolbar = NavigationToolbar2Tk(self.canvas, bar_frame)
         self._toolbar.update()
-        ttk.Button(bar_frame, text="Iso View", width=9,
-                   command=self._reset_view).pack(side=tk.RIGHT, padx=4)
+        self._toolbar.home = self._reset_view
 
         self._verts: Optional[np.ndarray] = None
         self.ax.set_title("Load an STL to begin")
@@ -151,7 +154,6 @@ class ModelViewer:
             z_mid = (zone.z_start + zone.z_end) / 2
             n = build_direction(zone.b_deg)
             u, v = np.array([1, 0, 0], dtype=float), np.array([0, 1, 0], dtype=float)
-            # Build a local frame perpendicular to n
             if abs(zone.b_deg) > 0.01:
                 theta = math.radians(zone.b_deg)
                 u = np.array([math.cos(theta), 0, -math.sin(theta)])
@@ -167,12 +169,11 @@ class ModelViewer:
             ys = [c[1] for c in corners] + [corners[0][1]]
             zs = [c[2] for c in corners] + [corners[0][2]]
             self.ax.plot(xs, ys, zs, color=color, linewidth=2, alpha=0.7)
-            # Label
             self.ax.text(centre[0], centre[1], centre[2],
-                         f"B={zone.b_deg:.0f}°", color=color, fontsize=8)
+                         f"B={zone.b_deg:.0f}", color=color, fontsize=8)
         self.canvas.draw()
 
-    def _reset_view(self):
+    def _reset_view(self, *_args):
         """Reset to isometric view with correct limits."""
         if self._verts is not None and len(self._verts) > 0:
             _equalize_3d_axes(self.ax, self._verts)
@@ -235,77 +236,235 @@ class BAngleChart:
 
 
 # ===================================================================
-# Toolpath 3-D preview
+# Toolpath 3-D preview with layer slider
 # ===================================================================
 
+def _extract_layer_segments(steps):
+    """Extract extrusion segments from a subset of steps.
+
+    Returns list of (pts_Nx3, bs_N) tuples for extrusion runs.
+    """
+    extrude_segs = []
+    cur_pts: List[List[float]] = []
+    cur_bs: List[float] = []
+    cur_extruding: Optional[bool] = None
+    last_pt: Optional[List[float]] = None
+    last_b: float = 0.0
+
+    for step in steps:
+        if not isinstance(step, Move):
+            continue
+        if None in (step.x, step.y, step.z):
+            continue
+
+        pt = [step.x, step.y, step.z]
+        b = step.b if step.b is not None else 0.0
+        is_ext = step.state.extrusion_mode == ExtrusionMode.ON
+
+        if cur_extruding is None:
+            cur_extruding = is_ext
+            cur_pts.append(pt)
+            cur_bs.append(b)
+            last_pt, last_b = pt, b
+            continue
+
+        if is_ext != cur_extruding:
+            if len(cur_pts) >= 2 and cur_extruding:
+                extrude_segs.append(
+                    (np.array(cur_pts), np.array(cur_bs)))
+            cur_pts = [last_pt, pt]
+            cur_bs = [last_b, b]
+            cur_extruding = is_ext
+        else:
+            cur_pts.append(pt)
+            cur_bs.append(b)
+
+        last_pt, last_b = pt, b
+
+    if len(cur_pts) >= 2 and cur_extruding:
+        extrude_segs.append((np.array(cur_pts), np.array(cur_bs)))
+
+    return extrude_segs
+
+
 class ToolpathViewer:
+    """3-D toolpath preview with per-layer slider (like PrusaSlicer).
+
+    Performance optimisations vs. naive approach:
+      - One Line3DCollection per *layer* (not per segment).
+      - Points downsampled to ~8 000 total.
+      - Lower figure DPI (85) for faster rendering.
+      - Slider toggles collection visibility (O(1) per layer).
+      - Home button = iso view (overrides default matplotlib zoom-to-fit).
+    """
+
     def __init__(self, parent: tk.Widget):
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self.fig = Figure(figsize=(6, 6), dpi=100)
+        self.fig = Figure(figsize=(6, 6), dpi=85)
         self.ax = self.fig.add_subplot(111, projection="3d")
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        # Toolbar — override home = iso view
         bar_frame = ttk.Frame(frame)
         bar_frame.pack(fill=tk.X)
         self._toolbar = NavigationToolbar2Tk(self.canvas, bar_frame)
         self._toolbar.update()
-        ttk.Button(bar_frame, text="Iso View", width=9,
-                   command=self._reset_view).pack(side=tk.RIGHT, padx=4)
+        self._toolbar.home = self._reset_view
+
+        # Layer slider (PrusaSlicer-style)
+        slider_frame = ttk.Frame(frame)
+        slider_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(slider_frame, text="Layer:").pack(side=tk.LEFT)
+        self._layer_slider = tk.Scale(
+            slider_frame, from_=0, to=0, orient=tk.HORIZONTAL,
+            showvalue=False, command=self._on_layer_change)
+        self._layer_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self._layer_label = ttk.Label(slider_frame, text="0 / 0", width=12)
+        self._layer_label.pack(side=tk.RIGHT)
 
         self._pts: Optional[np.ndarray] = None
+        self._layer_collections: List[Line3DCollection] = []
+        self._max_layer: int = 0
         self.ax.set_title("Toolpath Preview  (slice first)")
 
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
     def update(self, steps: list):
+        """Parse steps into per-layer collections and display."""
         self.ax.clear()
         # Remove old colorbars
         while self.fig.axes[1:]:
             self.fig.delaxes(self.fig.axes[-1])
+        self._layer_collections.clear()
 
-        extrude_segs, travel_segs, all_pts = _extract_segments(steps)
-        if len(all_pts) < 2:
+        # Split steps into layers at "Layer ..." comments
+        layer_groups = self._split_into_layers(steps)
+        if not layer_groups:
             self.ax.set_title("No toolpath to preview")
             self.canvas.draw()
             return
 
-        self._pts = all_pts
+        # Extract extrusion segments per layer
+        per_layer_segs = []
+        total_pts = 0
+        for group in layer_groups:
+            segs = _extract_layer_segments(group)
+            if segs:
+                n = sum(len(pts) for pts, _ in segs)
+                per_layer_segs.append(segs)
+                total_pts += n
 
-        # Determine global colour range from all extrusion B values
-        all_bs = np.concatenate([bs for _, bs in extrude_segs]) if extrude_segs else np.array([0.0])
+        if not per_layer_segs:
+            self.ax.set_title("No extrusion points")
+            self.canvas.draw()
+            return
+
+        # Compute downsample stride
+        stride = max(1, total_pts // _MAX_DISPLAY_POINTS)
+
+        # Global colour range
+        all_bs = np.concatenate(
+            [bs for segs in per_layer_segs for _, bs in segs])
         vmin, vmax = float(all_bs.min()), float(all_bs.max())
         if abs(vmax - vmin) < 1e-6:
             vmax = vmin + 1.0
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
 
-        # Draw extrusion segments as coloured lines
-        n_ext_pts = 0
-        for pts, bs in extrude_segs:
-            n_ext_pts += len(pts)
-            points = pts.reshape(-1, 1, 3)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            seg_vals = (bs[:-1] + bs[1:]) / 2.0
-            lc = Line3DCollection(segments, cmap="coolwarm", norm=norm)
-            lc.set_array(seg_vals)
+        # Global point bounds (for axis limits)
+        all_pts_list = [pts for segs in per_layer_segs for pts, _ in segs]
+        self._pts = np.concatenate(all_pts_list)
+
+        # Build one Line3DCollection per layer
+        display_pts = 0
+        for segs in per_layer_segs:
+            combined_segs = []
+            combined_vals = []
+            for pts, bs in segs:
+                # Downsample
+                if stride > 1 and len(pts) > stride * 2:
+                    idx = np.arange(0, len(pts), stride)
+                    if idx[-1] != len(pts) - 1:
+                        idx = np.append(idx, len(pts) - 1)
+                    pts = pts[idx]
+                    bs = bs[idx]
+                display_pts += len(pts)
+                p = pts.reshape(-1, 1, 3)
+                seg_pairs = np.concatenate([p[:-1], p[1:]], axis=1)
+                vals = (bs[:-1] + bs[1:]) / 2.0
+                combined_segs.append(seg_pairs)
+                combined_vals.append(vals)
+
+            merged_segs = np.concatenate(combined_segs, axis=0)
+            merged_vals = np.concatenate(combined_vals)
+            lc = Line3DCollection(merged_segs, cmap="coolwarm", norm=norm)
+            lc.set_array(merged_vals)
             lc.set_linewidth(0.6)
             self.ax.add_collection3d(lc)
+            self._layer_collections.append(lc)
 
-        # Draw travel segments as thin grey lines
-        for pts in travel_segs:
-            self.ax.plot(pts[:, 0], pts[:, 1], pts[:, 2],
-                         color="grey", linewidth=0.3, alpha=0.25)
+        self._max_layer = len(self._layer_collections) - 1
 
+        # Axis setup
         _equalize_3d_axes(self.ax, self._pts)
-        self.ax.set_title(f"Toolpath ({n_ext_pts} extrusion pts, "
-                          f"{len(travel_segs)} travels)")
+        self.ax.set_title(
+            f"Toolpath ({display_pts} pts, {self._max_layer + 1} layers)")
 
+        # Colour bar
         sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=norm)
         sm.set_array([])
         self.fig.colorbar(sm, ax=self.ax, label="B angle (deg)", shrink=0.6)
+
+        # Configure slider
+        self._layer_slider.configure(from_=0, to=self._max_layer)
+        self._layer_slider.set(self._max_layer)
+        self._layer_label.config(
+            text=f"{self._max_layer} / {self._max_layer}")
+
         self.canvas.draw()
 
-    def _reset_view(self):
+    # ------------------------------------------------------------------
+    # Layer parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_into_layers(steps: list) -> List[list]:
+        """Split the step list at layer-comment boundaries."""
+        layers: List[list] = []
+        current: list = []
+        for step in steps:
+            if (isinstance(step, SC) and step.comment
+                    and step.comment.startswith("Layer ")):
+                if current:
+                    layers.append(current)
+                current = [step]
+            else:
+                current.append(step)
+        if current:
+            layers.append(current)
+        return layers
+
+    # ------------------------------------------------------------------
+    # Slider callback
+    # ------------------------------------------------------------------
+
+    def _on_layer_change(self, val):
+        layer_idx = int(float(val))
+        self._layer_label.config(
+            text=f"{layer_idx} / {self._max_layer}")
+        for i, lc in enumerate(self._layer_collections):
+            lc.set_visible(i <= layer_idx)
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # View reset
+    # ------------------------------------------------------------------
+
+    def _reset_view(self, *_args):
         if self._pts is not None and len(self._pts) > 0:
             _equalize_3d_axes(self.ax, self._pts)
             self.canvas.draw()
@@ -367,7 +526,6 @@ class BuildZoneEditor:
                 child.configure(state=state)
             except tk.TclError:
                 pass
-        # Treeview doesn't support state, toggle visibility
         if not manual:
             self.zones.clear()
             self._refresh_tree()
@@ -463,7 +621,7 @@ class SlicerApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("toolpath4 — 4-Axis XYZB Slicer")
+        self.root.title("toolpath4 -- 4-Axis XYZB Slicer")
         self.root.geometry("1600x900")
 
         self.stl_path: Optional[str] = None
@@ -479,7 +637,7 @@ class SlicerApp:
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Left panel (controls) — scrollable via canvas
+        # Left panel (controls)
         left = ttk.Frame(main, width=380)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=5)
         left.pack_propagate(False)
@@ -587,7 +745,6 @@ class SlicerApp:
         """Redraw build-plane indicators on the 3D model."""
         if self.mesh is None:
             return
-        # Re-render the model then overlay planes
         self.model_viewer.show_model(self.stl_path)
         zones = self.zone_editor.get_zones()
         if zones:
