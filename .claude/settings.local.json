@@ -17,7 +17,8 @@
       "Bash(/c/msys64/usr/bin/pacman.exe -Ss qt5)",
       "Bash(/c/msys64/usr/bin/pacman.exe -Ss \"ucrt64.*qt5-base\")",
       "Bash(rm -f Makefile Makefile.Debug Makefile.Release .qmake.stash)",
-      "Bash(PATH=\"/c/msys64/ucrt64/bin:$PATH\" /c/msys64/ucrt64/bin/qmake.exe testing.pro)"
+      "Bash(PATH=\"/c/msys64/ucrt64/bin:$PATH\" /c/msys64/ucrt64/bin/qmake.exe testing.pro)",
+      "Bash(c:/python314/python.exe -m pip install matplotlib trimesh)"
     ]
   }
 }
