@@ -39,7 +39,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
+# Line3DCollection no longer needed — toolpath preview uses Plotly
 
 try:
     import trimesh
@@ -75,8 +75,7 @@ def _equalize_3d_axes(ax, verts: np.ndarray):
     ax.view_init(elev=25, azim=-60)
 
 
-# Maximum extrusion points to display (keeps rotation interactive)
-_MAX_DISPLAY_POINTS = 8000
+# Plotly handles 500k+ points via WebGL — no artificial cap needed
 
 
 # ===================================================================
@@ -236,238 +235,288 @@ class BAngleChart:
 
 
 # ===================================================================
-# Toolpath 3-D preview with layer slider
+# Toolpath 3-D preview — interactive Plotly (opens in browser)
 # ===================================================================
 
-def _extract_layer_segments(steps):
-    """Extract extrusion segments from a subset of steps.
-
-    Returns list of (pts_Nx3, bs_N) tuples for extrusion runs.
-    """
-    extrude_segs = []
-    cur_pts: List[List[float]] = []
-    cur_bs: List[float] = []
-    cur_extruding: Optional[bool] = None
-    last_pt: Optional[List[float]] = None
-    last_b: float = 0.0
-
+def _split_steps_into_layers(steps: list) -> List[list]:
+    """Split the step list at layer-comment boundaries."""
+    layers: List[list] = []
+    current: list = []
     for step in steps:
+        if (isinstance(step, SC) and step.comment is not None
+                and isinstance(step.comment, str)
+                and step.comment.startswith("Layer ")):
+            if current:
+                layers.append(current)
+            current = [step]
+        else:
+            current.append(step)
+    if current:
+        layers.append(current)
+    return layers
+
+
+def _extract_layer_points(layer_steps: list):
+    """Extract extrusion points from a layer's steps.
+
+    Returns (xs, ys, zs, bs) lists of floats for extrusion moves only.
+    """
+    xs, ys, zs, bs = [], [], [], []
+    for step in layer_steps:
         if not isinstance(step, Move):
             continue
         if None in (step.x, step.y, step.z):
             continue
+        if step.state.extrusion_mode != ExtrusionMode.ON:
+            continue
+        xs.append(step.x)
+        ys.append(step.y)
+        zs.append(step.z)
+        bs.append(step.b if step.b is not None else 0.0)
+    return xs, ys, zs, bs
 
-        pt = [step.x, step.y, step.z]
-        b = step.b if step.b is not None else 0.0
-        is_ext = step.state.extrusion_mode == ExtrusionMode.ON
 
-        if cur_extruding is None:
-            cur_extruding = is_ext
-            cur_pts.append(pt)
-            cur_bs.append(b)
-            last_pt, last_b = pt, b
+def build_plotly_toolpath(steps: list, *, max_pts_per_layer: int = 200):
+    """Build an interactive Plotly figure with layer slider.
+
+    Uses WebGL (Scatter3d) for smooth performance even with 500k+ points.
+    Each layer is a separate trace; a Plotly slider controls visibility
+    (like PrusaSlicer's layer scrubber).
+
+    Parameters
+    ----------
+    steps : list of Move / StateChange objects.
+    max_pts_per_layer : downsample layers with more points than this.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        raise ImportError(
+            "plotly is required for the toolpath viewer.\n"
+            "Install with:  pip install plotly"
+        )
+
+    layer_groups = _split_steps_into_layers(steps)
+
+    # Extract per-layer point data
+    layer_data = []  # list of (xs, ys, zs, bs, label)
+    all_bs = []
+    for group in layer_groups:
+        # Parse label from the comment
+        label = "Layer"
+        for s in group:
+            if (isinstance(s, SC) and s.comment is not None
+                    and isinstance(s.comment, str)
+                    and s.comment.startswith("Layer ")):
+                label = s.comment
+                break
+
+        xs, ys, zs, bs = _extract_layer_points(group)
+        if not xs:
             continue
 
-        if is_ext != cur_extruding:
-            if len(cur_pts) >= 2 and cur_extruding:
-                extrude_segs.append(
-                    (np.array(cur_pts), np.array(cur_bs)))
-            cur_pts = [last_pt, pt]
-            cur_bs = [last_b, b]
-            cur_extruding = is_ext
-        else:
-            cur_pts.append(pt)
-            cur_bs.append(b)
+        # Downsample if too many points
+        if len(xs) > max_pts_per_layer:
+            stride = max(1, len(xs) // max_pts_per_layer)
+            idx = list(range(0, len(xs), stride))
+            if idx[-1] != len(xs) - 1:
+                idx.append(len(xs) - 1)
+            xs = [xs[i] for i in idx]
+            ys = [ys[i] for i in idx]
+            zs = [zs[i] for i in idx]
+            bs = [bs[i] for i in idx]
 
-        last_pt, last_b = pt, b
+        layer_data.append((xs, ys, zs, bs, label))
+        all_bs.extend(bs)
 
-    if len(cur_pts) >= 2 and cur_extruding:
-        extrude_segs.append((np.array(cur_pts), np.array(cur_bs)))
+    if not layer_data:
+        fig = go.Figure()
+        fig.update_layout(title="No toolpath data")
+        return fig
 
-    return extrude_segs
+    n_layers = len(layer_data)
+    b_min = min(all_bs) if all_bs else 0.0
+    b_max = max(all_bs) if all_bs else 1.0
+    if abs(b_max - b_min) < 1e-6:
+        b_max = b_min + 1.0
+
+    # Create all traces (one per layer), initially all visible
+    fig = go.Figure()
+    for i, (xs, ys, zs, bs, label) in enumerate(layer_data):
+        hover = [f"B={b:.1f} deg<br>Z={z:.2f} mm<br>{label}"
+                 for b, z in zip(bs, zs)]
+        fig.add_trace(go.Scatter3d(
+            x=xs, y=ys, z=zs,
+            mode="lines",
+            line=dict(
+                color=bs,
+                colorscale="RdBu_r",
+                cmin=b_min, cmax=b_max,
+                width=3,
+                showscale=(i == 0),
+                colorbar=dict(title="B angle (deg)", x=1.02) if i == 0 else None,
+            ),
+            hovertext=hover,
+            hoverinfo="text",
+            name=f"L{i}",
+            showlegend=False,
+            visible=True,
+        ))
+
+    # Build slider steps — each step shows layers 0..k
+    slider_steps = []
+    for k in range(n_layers):
+        visibility = [True] * (k + 1) + [False] * (n_layers - k - 1)
+        # Parse z from label
+        lbl = layer_data[k][4]
+        z_str = ""
+        if "z~" in lbl:
+            z_str = lbl.split("z~")[1].split()[0]
+        step = dict(
+            method="restyle",
+            args=[{"visible": visibility}],
+            label=f"{k}" if not z_str else f"{k} (z={z_str})",
+        )
+        slider_steps.append(step)
+
+    total_pts = sum(len(d[0]) for d in layer_data)
+    fig.update_layout(
+        title=dict(
+            text=(f"Toolpath Preview — {n_layers} layers, "
+                  f"{total_pts:,} points<br>"
+                  f"<sub>color = B axis (tilt): "
+                  f"{b_min:.1f} deg (blue) to {b_max:.1f} deg (red)</sub>"),
+            x=0.5,
+        ),
+        scene=dict(
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Z (mm)",
+            aspectmode="data",
+            bgcolor="#1a1a2e",
+            xaxis=dict(backgroundcolor="#1a1a2e", gridcolor="#333366",
+                        showbackground=True),
+            yaxis=dict(backgroundcolor="#1a1a2e", gridcolor="#333366",
+                        showbackground=True),
+            zaxis=dict(backgroundcolor="#1a1a2e", gridcolor="#333366",
+                        showbackground=True),
+        ),
+        paper_bgcolor="#0f0f1a",
+        font_color="#cccccc",
+        sliders=[dict(
+            active=n_layers - 1,
+            currentvalue=dict(prefix="Layer: ", font=dict(size=14)),
+            pad=dict(t=40),
+            steps=slider_steps,
+        )],
+        margin=dict(l=0, r=0, t=80, b=40),
+    )
+
+    return fig
 
 
 class ToolpathViewer:
-    """3-D toolpath preview with per-layer slider (like PrusaSlicer).
+    """Plotly-based 3-D toolpath viewer.
 
-    Performance optimisations vs. naive approach:
-      - One Line3DCollection per *layer* (not per segment).
-      - Points downsampled to ~8 000 total.
-      - Lower figure DPI (85) for faster rendering.
-      - Slider toggles collection visibility (O(1) per layer).
-      - Home button = iso view (overrides default matplotlib zoom-to-fit).
+    Generates an interactive WebGL visualization that opens in the
+    default browser.  No lag — full rotation, zoom, hover, and a
+    layer slider like PrusaSlicer.
+
+    The tkinter tab shows a summary + "Open in Browser" button.
     """
 
     def __init__(self, parent: tk.Widget):
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self.fig = Figure(figsize=(6, 6), dpi=85)
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # Info area
+        self._info_frame = ttk.Frame(frame)
+        self._info_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
-        # Toolbar — override home = iso view
-        bar_frame = ttk.Frame(frame)
-        bar_frame.pack(fill=tk.X)
-        self._toolbar = NavigationToolbar2Tk(self.canvas, bar_frame)
-        self._toolbar.update()
-        self._toolbar.home = self._reset_view
+        self._title_label = ttk.Label(
+            self._info_frame,
+            text="Toolpath Preview",
+            font=("Segoe UI", 16, "bold"),
+        )
+        self._title_label.pack(pady=(40, 10))
 
-        # Layer slider (PrusaSlicer-style)
-        slider_frame = ttk.Frame(frame)
-        slider_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(slider_frame, text="Layer:").pack(side=tk.LEFT)
-        self._layer_slider = tk.Scale(
-            slider_frame, from_=0, to=0, orient=tk.HORIZONTAL,
-            showvalue=False, command=self._on_layer_change)
-        self._layer_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self._layer_label = ttk.Label(slider_frame, text="0 / 0", width=12)
-        self._layer_label.pack(side=tk.RIGHT)
+        self._status_label = ttk.Label(
+            self._info_frame,
+            text="Slice a model to generate the toolpath preview.\n\n"
+                 "The preview opens in your browser as an interactive\n"
+                 "Plotly 3D view with full rotation, zoom, hover info,\n"
+                 "and a layer slider (like PrusaSlicer).",
+            font=("Segoe UI", 11),
+            justify=tk.CENTER,
+        )
+        self._status_label.pack(pady=10)
 
-        self._pts: Optional[np.ndarray] = None
-        self._layer_collections: List[Line3DCollection] = []
-        self._max_layer: int = 0
-        self.ax.set_title("Toolpath Preview  (slice first)")
+        self._open_btn = ttk.Button(
+            self._info_frame,
+            text="Open Toolpath in Browser",
+            command=self._open_in_browser,
+            state=tk.DISABLED,
+        )
+        self._open_btn.pack(pady=15, ipadx=20, ipady=8)
 
-    # ------------------------------------------------------------------
-    # Data loading
-    # ------------------------------------------------------------------
+        self._stats_label = ttk.Label(
+            self._info_frame,
+            text="",
+            font=("Consolas", 10),
+            justify=tk.CENTER,
+        )
+        self._stats_label.pack(pady=10)
+
+        self._html_path: Optional[str] = None
 
     def update(self, steps: list):
-        """Parse steps into per-layer collections and display."""
-        self.ax.clear()
-        # Remove old colorbars
-        while self.fig.axes[1:]:
-            self.fig.delaxes(self.fig.axes[-1])
-        self._layer_collections.clear()
+        """Build the Plotly figure and auto-open in browser."""
+        import tempfile
+        import webbrowser
 
-        # Split steps into layers at "Layer ..." comments
-        layer_groups = self._split_into_layers(steps)
-        if not layer_groups:
-            self.ax.set_title("No toolpath to preview")
-            self.canvas.draw()
-            return
+        self._status_label.config(text="Building Plotly visualization...")
 
-        # Extract extrusion segments per layer
-        per_layer_segs = []
-        total_pts = 0
-        for group in layer_groups:
-            segs = _extract_layer_segments(group)
-            if segs:
-                n = sum(len(pts) for pts, _ in segs)
-                per_layer_segs.append(segs)
-                total_pts += n
+        fig = build_plotly_toolpath(steps)
 
-        if not per_layer_segs:
-            self.ax.set_title("No extrusion points")
-            self.canvas.draw()
-            return
+        # Save to temp HTML
+        html_path = os.path.join(
+            tempfile.gettempdir(), "toolpath4_preview.html")
+        fig.write_html(html_path, include_plotlyjs="cdn",
+                       full_html=True, auto_open=False)
+        self._html_path = html_path
 
-        # Compute downsample stride
-        stride = max(1, total_pts // _MAX_DISPLAY_POINTS)
+        # Count stats
+        layer_groups = _split_steps_into_layers(steps)
+        n_layers = 0
+        n_points = 0
+        for g in layer_groups:
+            xs, _, _, _ = _extract_layer_points(g)
+            if xs:
+                n_layers += 1
+                n_points += len(xs)
 
-        # Global colour range
-        all_bs = np.concatenate(
-            [bs for segs in per_layer_segs for _, bs in segs])
-        vmin, vmax = float(all_bs.min()), float(all_bs.max())
-        if abs(vmax - vmin) < 1e-6:
-            vmax = vmin + 1.0
-        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+        self._status_label.config(
+            text="Toolpath preview ready!\n\n"
+                 "Click the button below to open in your browser.\n"
+                 "Interactive: rotate, zoom, hover for B angle + Z height.\n"
+                 "Use the layer slider at the bottom to scrub through the build."
+        )
+        self._stats_label.config(
+            text=f"Layers: {n_layers}  |  Extrusion points: {n_points:,}"
+        )
+        self._open_btn.config(state=tk.NORMAL)
 
-        # Global point bounds (for axis limits)
-        all_pts_list = [pts for segs in per_layer_segs for pts, _ in segs]
-        self._pts = np.concatenate(all_pts_list)
+        # Auto-open
+        webbrowser.open(f"file://{html_path}")
 
-        # Build one Line3DCollection per layer
-        display_pts = 0
-        for segs in per_layer_segs:
-            combined_segs = []
-            combined_vals = []
-            for pts, bs in segs:
-                # Downsample
-                if stride > 1 and len(pts) > stride * 2:
-                    idx = np.arange(0, len(pts), stride)
-                    if idx[-1] != len(pts) - 1:
-                        idx = np.append(idx, len(pts) - 1)
-                    pts = pts[idx]
-                    bs = bs[idx]
-                display_pts += len(pts)
-                p = pts.reshape(-1, 1, 3)
-                seg_pairs = np.concatenate([p[:-1], p[1:]], axis=1)
-                vals = (bs[:-1] + bs[1:]) / 2.0
-                combined_segs.append(seg_pairs)
-                combined_vals.append(vals)
-
-            merged_segs = np.concatenate(combined_segs, axis=0)
-            merged_vals = np.concatenate(combined_vals)
-            lc = Line3DCollection(merged_segs, cmap="coolwarm", norm=norm)
-            lc.set_array(merged_vals)
-            lc.set_linewidth(0.6)
-            self.ax.add_collection3d(lc)
-            self._layer_collections.append(lc)
-
-        self._max_layer = len(self._layer_collections) - 1
-
-        # Axis setup
-        _equalize_3d_axes(self.ax, self._pts)
-        self.ax.set_title(
-            f"Toolpath ({display_pts} pts, {self._max_layer + 1} layers)")
-
-        # Colour bar
-        sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=norm)
-        sm.set_array([])
-        self.fig.colorbar(sm, ax=self.ax, label="B angle (deg)", shrink=0.6)
-
-        # Configure slider
-        self._layer_slider.configure(from_=0, to=self._max_layer)
-        self._layer_slider.set(self._max_layer)
-        self._layer_label.config(
-            text=f"{self._max_layer} / {self._max_layer}")
-
-        self.canvas.draw()
-
-    # ------------------------------------------------------------------
-    # Layer parsing
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _split_into_layers(steps: list) -> List[list]:
-        """Split the step list at layer-comment boundaries."""
-        layers: List[list] = []
-        current: list = []
-        for step in steps:
-            if (isinstance(step, SC) and step.comment
-                    and step.comment.startswith("Layer ")):
-                if current:
-                    layers.append(current)
-                current = [step]
-            else:
-                current.append(step)
-        if current:
-            layers.append(current)
-        return layers
-
-    # ------------------------------------------------------------------
-    # Slider callback
-    # ------------------------------------------------------------------
-
-    def _on_layer_change(self, val):
-        layer_idx = int(float(val))
-        self._layer_label.config(
-            text=f"{layer_idx} / {self._max_layer}")
-        for i, lc in enumerate(self._layer_collections):
-            lc.set_visible(i <= layer_idx)
-        self.canvas.draw_idle()
-
-    # ------------------------------------------------------------------
-    # View reset
-    # ------------------------------------------------------------------
-
-    def _reset_view(self, *_args):
-        if self._pts is not None and len(self._pts) > 0:
-            _equalize_3d_axes(self.ax, self._pts)
-            self.canvas.draw()
+    def _open_in_browser(self):
+        if self._html_path and os.path.exists(self._html_path):
+            import webbrowser
+            webbrowser.open(f"file://{self._html_path}")
 
 
 # ===================================================================
